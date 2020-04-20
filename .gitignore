@@ -1,2 +1,3 @@
 /target
+/sndio-sys/target
 Cargo.lock
