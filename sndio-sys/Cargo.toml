@@ -1,0 +1,9 @@
+[package]
+name = "sndio-sys"
+version = "0.0.1"
+authors = ["Michael Killough <michaeljkillough@gmail.com>"]
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
