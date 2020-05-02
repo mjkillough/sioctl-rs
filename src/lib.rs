@@ -1,8 +1,11 @@
 use std::collections::HashMap;
 use std::ffi::CStr;
+use std::mem;
 use std::os::raw::{c_char, c_int, c_uint, c_void};
+use std::os::unix::io::RawFd;
 use std::sync::{Arc, Mutex};
-use std::thread::{self, JoinHandle};
+use std::thread;
+use std::thread::JoinHandle;
 
 use libc::{poll, EINTR, POLLIN, SIGHUP};
 use nix::errno::errno;
@@ -19,9 +22,10 @@ pub struct Control {
     pub value: u8,
 }
 
-// TODO: implement Drop
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 struct Handle(*mut sioctl_hdl);
+
+unsafe impl Send for Handle {}
 
 impl Handle {
     fn as_ptr(&self) -> *mut sioctl_hdl {
@@ -29,12 +33,18 @@ impl Handle {
     }
 }
 
-unsafe impl Send for Handle {}
-unsafe impl Sync for Handle {}
+impl Drop for Handle {
+    fn drop(&mut self) {
+        unsafe {
+            sioctl_close(self.0);
+        }
+    }
+}
 
 pub struct Sioctl {
     handle: Handle,
     shared: Arc<Shared>,
+    shared_ptr: SharedPtr,
 }
 
 impl Sioctl {
@@ -48,15 +58,28 @@ impl Sioctl {
         });
         let shared = Arc::new(Shared { inner });
 
+        // We need a pointer to pass the pointer from our Arc<Shared> to C.
+        // We wrap this raw pointer in SharedPtr() and store it, so that the
+        // Arc<Shared> is eventually dropped when SharedPtr() goes out of
+        // scope.
+        let arc = Arc::clone(&shared);
+        let ptr = Arc::into_raw(arc);
+        let shared_ptr = SharedPtr(ptr);
+
         unsafe {
-            // TODO: Clean-up, as this will leak Shared.
-            let arc = Arc::clone(&shared);
-            let ptr = Arc::into_raw(arc) as *mut _;
+            // Casting *const Shared to *mut _ looks suspicious. This is
+            // because sndio requires a mutable pointer. We'll never mutate
+            // it (and neither will sndio), so this should(?) be defined.
+            let ptr = ptr as *mut _;
             sioctl_ondesc(handle.as_ptr(), Some(ondesc), ptr);
             sioctl_onval(handle.as_ptr(), Some(onval), ptr);
         };
 
-        Self { handle, shared }
+        Self {
+            handle,
+            shared,
+            shared_ptr,
+        }
     }
 
     pub fn controls(&self) -> Vec<Control> {
@@ -73,10 +96,19 @@ impl Sioctl {
             inner.callback = Some(Box::new(callback));
         }
 
-        let handle = self.handle.clone();
-        let thread = thread::spawn(|| polling_thread(self.handle));
+        // We create a pipe so that we can wake up polling_thread() to tell it
+        // to shutdown. Watcher will close(close_tx) when shutting down, which
+        // will cause SIGHUP on close_rx.
+        let (close_rx, close_tx) = nix::unistd::pipe().unwrap();
 
-        Watcher { handle, thread }
+        let handle = self.handle;
+        let thread_handle = thread::spawn(move || polling_thread(handle, close_rx));
+
+        Watcher {
+            shared_ptr: self.shared_ptr,
+            thread_handle: Some(thread_handle),
+            close_tx,
+        }
     }
 }
 
@@ -86,6 +118,7 @@ struct Inner {
 }
 
 /// Shared between the Rust objects and the C callbacks.
+/// Expects to be wrapped in an Arc to ensure appropriate lifetime.
 struct Shared {
     inner: Mutex<Inner>,
 }
@@ -113,17 +146,62 @@ impl Shared {
     }
 }
 
-pub struct Watcher {
-    handle: Handle,
-    thread: JoinHandle<()>,
+/// Wrapper around Arc<Shared>::into_raw() to ensure it is eventually Dropped.
+/// In theory we should ensure this is dropped after the associated Handle.
+/// In practise, we'll never get a callback as we don't call `sioctl_revents`
+/// when we're dropping them, so it doesn't matter.
+struct SharedPtr(*const Shared);
+
+unsafe impl Send for SharedPtr {}
+
+impl Drop for SharedPtr {
+    fn drop(&mut self) {
+        drop(unsafe { Arc::from_raw(self) });
+    }
 }
 
-fn polling_thread(handle: Handle) {
+// (Allow dead code because we need to control the lifetime of these fields).
+#[allow(dead_code)]
+pub struct Watcher {
+    shared_ptr: SharedPtr,
+    close_tx: RawFd,
+    thread_handle: Option<JoinHandle<()>>,
+}
+
+impl Watcher {
+    pub fn join(&mut self) {
+        if let Some(thread_handle) = mem::replace(&mut self.thread_handle, None) {
+            // Close close_tx(), which will cause SIGHUP on close_rx in the
+            // thread. The thread will then exit and we can wait for the
+            // thread to join.
+            nix::unistd::close(self.close_tx).unwrap();
+            thread_handle.join().unwrap();
+        }
+    }
+}
+
+impl Drop for Watcher {
+    fn drop(&mut self) {
+        self.join();
+    }
+}
+
+fn polling_thread(handle: Handle, close_rx: RawFd) {
     unsafe {
-        let nfds = sioctl_nfds(handle.as_ptr());
-        let mut pollfds = Vec::with_capacity(nfds as usize);
-        let nfds = sioctl_pollfd(handle.as_ptr(), pollfds.as_mut_ptr(), POLLIN as i32);
-        pollfds.set_len(nfds as usize);
+        let nfds = sioctl_nfds(handle.as_ptr()) as usize;
+        let mut pollfds = Vec::with_capacity(nfds);
+        let mut nfds = sioctl_pollfd(handle.as_ptr(), pollfds.as_mut_ptr(), POLLIN as i32) as usize;
+        pollfds.set_len(nfds);
+
+        // Place the fd that indicates shutdown last, so that it's ignored by
+        // sioctl_revents() which will only look at first nfds.
+        pollfds.push(pollfd {
+            fd: close_rx,
+            events: POLLIN,
+            revents: 0,
+        });
+        let close_nfd = nfds;
+        nfds += 1;
 
         loop {
             while poll(pollfds.as_mut_ptr(), nfds as u32, -1) < 0 {
@@ -131,6 +209,12 @@ fn polling_thread(handle: Handle) {
                 if err != EINTR {
                     panic!("sioctl err: {}", err);
                 }
+            }
+
+            // Check if Watcher has asked us to exit via close_rx.
+            if i32::from(pollfds[close_nfd].revents) & SIGHUP > 0 {
+                nix::unistd::close(close_rx).unwrap();
+                break;
             }
 
             let revents = sioctl_revents(handle.as_ptr(), pollfds.as_mut_ptr());

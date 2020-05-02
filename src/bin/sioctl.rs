@@ -1,19 +1,23 @@
 use sioctl::*;
 
 fn main() {
-    //let p = |parameter| println!("parameter: {:?}", parameter);
-    //let v = |value| println!("value: {:?}", value);
     let s = Sioctl::new();
 
-    println!("initial");
+    println!("Initial state of controls:");
     for control in s.controls() {
         println!("{:?}", control);
     }
 
-    println!("watching...");
-    s.watch(|control| println!("{:?}", control));
+    println!("");
 
+    println!("Watching for changes (press Enter to exit):");
+    let mut watcher = s.watch(|control| println!("{:?}", control));
+
+    // Wait for Enter:
     let mut buf = String::new();
     std::io::stdin().read_line(&mut buf).unwrap();
-}
 
+    println!("Shutting down...");
+    watcher.join();
+    println!("Gracefully shut down. Bye.");
+}
