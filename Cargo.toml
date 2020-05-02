@@ -2,6 +2,12 @@
 name = "sioctl"
 version = "0.0.1"
 authors = ["Michael Killough <michaeljkillough@gmail.com>"]
+description = "An interface for reading the state of sndio controls."
+repository = "https://github.com/mjkillough/sioctl-rs"
+readme = "README.md"
+keywords = ["sndio", "sound", "audio", "openbsd"]
+license = "MIT"
+categories = ["multimedia"]
 edition = "2018"
 
 [[bin]]

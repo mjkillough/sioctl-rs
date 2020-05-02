@@ -1,4 +1,4 @@
-use sioctl::*;
+use sioctl::Sioctl;
 
 fn main() {
     let s = Sioctl::new();
