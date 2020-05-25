@@ -46,6 +46,14 @@ A more complete example is available in [`src/bin/sioctl.rs`].
 
 [`src/bin/sioctl.rs`]: https://github.com/mjkillough/sioctl-rs/blob/master/src/bin/sioctl.rs
 
+## Installation
+
+The `sndio-sys` crate requires `libclang.so` which is present in the `llvm` package:
+
+```
+doas pkg_add llvm
+```
+
 ## License
 
 MIT
