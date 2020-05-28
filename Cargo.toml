@@ -1,6 +1,6 @@
 [package]
 name = "sioctl"
-version = "0.0.1"
+version = "0.0.2"
 authors = ["Michael Killough <michaeljkillough@gmail.com>"]
 description = "An interface for reading the state of sndio controls."
 repository = "https://github.com/mjkillough/sioctl-rs"
